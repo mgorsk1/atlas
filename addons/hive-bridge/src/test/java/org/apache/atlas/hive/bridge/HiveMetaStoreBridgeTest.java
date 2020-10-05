@@ -140,7 +140,7 @@ public class HiveMetaStoreBridgeTest {
         bridge.importHiveMetadata(null, null, true);
 
         // verify update is called on table
-        verify(atlasClientV2, times(2)).updateEntity(anyObject());
+        verify(atlasClientV2, times(1)).updateEntity(anyObject());
 
     }
 

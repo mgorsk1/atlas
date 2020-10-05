@@ -20,7 +20,8 @@ package org.apache.atlas.hive.bridge;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.sun.jersey.api.client.ClientResponse;
-import org.apache.atlas.type.AtlasType;
+import org.apache.atlas.AtlasException;
+import org.apache.atlas.model.instance.*;
 import org.apache.atlas.type.AtlasTypeUtil;
 import org.apache.atlas.ApplicationProperties;
 import org.apache.atlas.AtlasClientV2;
@@ -28,17 +29,11 @@ import org.apache.atlas.AtlasServiceException;
 import org.apache.atlas.hive.hook.events.BaseHiveEvent;
 import org.apache.atlas.hive.model.HiveDataTypes;
 import org.apache.atlas.hook.AtlasHookException;
-import org.apache.atlas.model.instance.AtlasEntityHeader;
-import org.apache.atlas.model.instance.EntityMutationResponse;
-import org.apache.atlas.model.instance.EntityMutations;
 import org.apache.atlas.utils.AtlasPathExtractorUtil;
 import org.apache.atlas.utils.AuthenticationUtil;
 import org.apache.atlas.utils.HdfsNameServiceResolver;
-import org.apache.atlas.model.instance.AtlasEntity;
 import org.apache.atlas.model.instance.AtlasEntity.AtlasEntityWithExtInfo;
 import org.apache.atlas.model.instance.AtlasEntity.AtlasEntitiesWithExtInfo;
-import org.apache.atlas.model.instance.AtlasObjectId;
-import org.apache.atlas.model.instance.AtlasStruct;
 import org.apache.atlas.utils.PathExtractorContext;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.collections.CollectionUtils;
@@ -61,6 +56,7 @@ import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
+import org.apache.hadoop.hive.ql.metadata.Partition;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -75,6 +71,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.apache.atlas.hive.hook.events.BaseHiveEvent.*;
 
@@ -98,6 +95,8 @@ public class HiveMetaStoreBridge {
     public static final String HDFS_PATH                       = "hdfs_path";
     public static final String DEFAULT_METASTORE_CATALOG       = "hive";
 
+    public final        int    BULK_TABLES_COUNT               = getBulkTablesCount();
+
     public static final String HOOK_AWS_S3_ATLAS_MODEL_VERSION_V2  = "v2";
 
     private static final int    EXIT_CODE_SUCCESS = 0;
@@ -111,6 +110,15 @@ public class HiveMetaStoreBridge {
 
     private String awsS3AtlasModelVersion = null;
 
+    // Use this to bump number of tables in bulk request.
+    // Defaults to 1 since Atlas likes to timeout even with single table in bulk ;)
+    private final int getBulkTablesCount() {
+        try {
+            return Integer.parseInt(System.getenv("BULK_TABLES_COUNT"));
+        } catch(Exception _) {
+            return 1;
+        }
+    }
 
     public static void main(String[] args) {
         int exitCode = EXIT_CODE_FAILED;
@@ -135,11 +143,13 @@ public class HiveMetaStoreBridge {
                 atlasEndpoint = new String[] { DEFAULT_ATLAS_URL };
             }
 
-
             if (!AuthenticationUtil.isKerberosAuthenticationEnabled()) {
-                String[] basicAuthUsernamePassword = AuthenticationUtil.getBasicAuthenticationInput();
+                String[] credentials = new String[2];
 
-                atlasClientV2 = new AtlasClientV2(atlasEndpoint, basicAuthUsernamePassword);
+                credentials[0] = System.getenv("ATLAS_USERNAME");
+                credentials[1] = System.getenv("ATLAS_PASSWORD");
+
+                atlasClientV2 = new AtlasClientV2(atlasEndpoint, credentials);
             } else {
                 UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
 
@@ -156,7 +166,7 @@ public class HiveMetaStoreBridge {
                     String         line = null;
 
                     while((line = br.readLine()) != null) {
-                        String val[] = line.split(":");
+                        String val[] = line.split(";");
 
                         if (ArrayUtils.isNotEmpty(val)) {
                             databaseToImport = val[0];
@@ -319,8 +329,9 @@ public class HiveMetaStoreBridge {
      * @param failOnError
      * @throws Exception
      */
-    private int importTables(AtlasEntity dbEntity, String databaseName, String tblName, final boolean failOnError) throws Exception {
+    private int importTables(AtlasEntity dbEntity, String databaseName, String tblName, final boolean failOnError) throws AtlasException, NullPointerException, HiveException {
         int tablesImported = 0;
+        int tablesInBulk = 0;
 
         final List<String> tableNames;
 
@@ -331,13 +342,46 @@ public class HiveMetaStoreBridge {
         }
 
         if(!CollectionUtils.isEmpty(tableNames)) {
-            LOG.info("Found {} tables to import in database {}", tableNames.size(), databaseName);
+            AtlasEntitiesWithExtInfo batch = null;
+            int tablesToImport = tableNames.size();
+
+            LOG.info("Found: {} tables to import in db: {}", tablesToImport, databaseName);
 
             try {
                 for (String tableName : tableNames) {
-                    int imported = importTable(dbEntity, databaseName, tableName, failOnError);
+                    try {
+                        LOG.info("Processing table: {} in db: {}", tableName, dbEntity.getAttribute("name").toString());
 
-                    tablesImported += imported;
+                        if (batch == null) {
+                            batch = new AtlasEntitiesWithExtInfo();
+                        }
+
+                        // this might cause NullPointerException
+                        Table table = hiveClient.getTable(databaseName, tableName);
+                        AtlasEntitiesWithExtInfo tableEntity = toTableEntity(dbEntity, table);
+
+                        for (AtlasEntity entity: tableEntity.getEntities()) {
+                            batch.addEntity(entity);
+                        }
+
+                        tablesInBulk += 1;
+                        tablesImported += 1;
+
+                        if (tablesInBulk % BULK_TABLES_COUNT == 0 || tablesImported == tablesToImport) {
+                            // this might cause AtlasServiceException (timeout)
+                            atlasClientV2.updateEntities(batch);
+
+                            batch = null;
+                            tablesInBulk = 0;
+                        }
+                    } catch (NullPointerException | AtlasHookException e) {
+                        LOG.warn("NullPointerException when retrieving table: {} from db: {}", tableName, databaseName);
+                    } catch (AtlasServiceException e) {
+                        LOG.warn("AtlasServiceException when retrieving table: {} from db: {}", tableName, databaseName);
+                        tablesImported -= tablesInBulk;
+                    } finally {
+                        LOG.info("Finished processing table: {} db: {}", tableName, databaseName);
+                    }
                 }
             } finally {
                 if (tablesImported == tableNames.size()) {
@@ -448,19 +492,9 @@ public class HiveMetaStoreBridge {
     private AtlasEntityWithExtInfo registerTable(AtlasEntity dbEntity, Table table) throws AtlasHookException {
         try {
             AtlasEntityWithExtInfo ret;
-            AtlasEntityWithExtInfo tableEntity = findTableEntity(table);
+            AtlasEntitiesWithExtInfo tableEntity = toTableEntity(dbEntity, table);
 
-            if (tableEntity == null) {
-                tableEntity = toTableEntity(dbEntity, table);
-
-                ret = registerInstance(tableEntity);
-            } else {
-                LOG.info("Table {}.{} is already registered with id {}. Updating entity.", table.getDbName(), table.getTableName(), tableEntity.getEntity().getGuid());
-
-                ret = toTableEntity(dbEntity, table, tableEntity);
-
-                updateInstance(ret);
-            }
+            ret = registerInstances(tableEntity, ATTRIBUTE_TABLE_TYPE);
 
             return ret;
         } catch (Exception e) {
@@ -516,36 +550,32 @@ public class HiveMetaStoreBridge {
      * @return
      * @throws Exception
      */
+    private AtlasEntityWithExtInfo registerInstances(AtlasEntitiesWithExtInfo entities, String returnEntityType) throws Exception {
+        AtlasEntitiesWithExtInfo result = registerInstances(entities);
+
+        for (AtlasEntity entity: result.getEntities()) {
+            if (entity.getTypeName() == returnEntityType) {
+                return new AtlasEntityWithExtInfo(entity);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Registers an entity in atlas
+     * @param entities
+     * @return
+     * @throws Exception
+     */
     private AtlasEntitiesWithExtInfo registerInstances(AtlasEntitiesWithExtInfo entities) throws Exception {
         if (LOG.isDebugEnabled()) {
             LOG.debug("creating {} entities: {}", entities.getEntities().size(), entities);
         }
 
-        AtlasEntitiesWithExtInfo ret = null;
-        EntityMutationResponse   response        = atlasClientV2.createEntities(entities);
-        List<AtlasEntityHeader>  createdEntities = response.getEntitiesByOperation(EntityMutations.EntityOperation.CREATE);
+        atlasClientV2.createEntities(entities);
 
-        if (CollectionUtils.isNotEmpty(createdEntities)) {
-            ret = new AtlasEntitiesWithExtInfo();
-
-            for (AtlasEntityHeader createdEntity : createdEntities) {
-                AtlasEntityWithExtInfo entity = atlasClientV2.getEntityByGuid(createdEntity.getGuid());
-
-                ret.addEntity(entity.getEntity());
-
-                if (MapUtils.isNotEmpty(entity.getReferredEntities())) {
-                    for (Map.Entry<String, AtlasEntity> entry : entity.getReferredEntities().entrySet()) {
-                        ret.addReferredEntity(entry.getKey(), entry.getValue());
-                    }
-                }
-
-                LOG.info("Created {} entity: name={}, guid={}", entity.getEntity().getTypeName(), entity.getEntity().getAttribute(ATTRIBUTE_QUALIFIED_NAME), entity.getEntity().getGuid());
-            }
-        }
-
-        clearRelationshipAttributes(ret);
-
-        return ret;
+        return entities;
     }
 
     private void updateInstance(AtlasEntityWithExtInfo entity) throws AtlasServiceException {
@@ -609,16 +639,17 @@ public class HiveMetaStoreBridge {
      * @return Newly created Hive AtlasEntity
      * @throws Exception
      */
-    private AtlasEntityWithExtInfo toTableEntity(AtlasEntity database, Table hiveTable) throws AtlasHookException {
+    private AtlasEntitiesWithExtInfo toTableEntity(AtlasEntity database, Table hiveTable) throws AtlasHookException, HiveException, AtlasException {
         return toTableEntity(database, hiveTable, null);
     }
 
-    private AtlasEntityWithExtInfo toTableEntity(AtlasEntity database, final Table hiveTable, AtlasEntityWithExtInfo table) throws AtlasHookException {
+    private AtlasEntitiesWithExtInfo toTableEntity(AtlasEntity database, final Table hiveTable, AtlasEntityWithExtInfo table) throws AtlasHookException, HiveException, AtlasException {
         if (table == null) {
             table = new AtlasEntityWithExtInfo(new AtlasEntity(HiveDataTypes.HIVE_TABLE.getName()));
         }
 
         AtlasEntity tableEntity        = table.getEntity();
+        AtlasEntitiesWithExtInfo ret   = new AtlasEntitiesWithExtInfo();
         String      tableQualifiedName = getTableQualifiedName(metadataNamespace, hiveTable);
         long        createTime         = BaseHiveEvent.getTableCreateTime(hiveTable);
         long        lastAccessTime     = hiveTable.getLastAccessTime() > 0 ? hiveTable.getLastAccessTime() : createTime;
@@ -655,21 +686,48 @@ public class HiveMetaStoreBridge {
         table.addReferredEntity(database);
         table.addReferredEntity(sdEntity);
 
+        ret.addEntity(sdEntity);
+
         if (partKeys != null) {
             for (AtlasEntity partKey : partKeys) {
                 table.addReferredEntity(partKey);
+                ret.addEntity(partKey);
             }
         }
 
         if (columns != null) {
             for (AtlasEntity column : columns) {
                 table.addReferredEntity(column);
+                ret.addEntity(column);
+            }
+        }
+
+        if (hiveTable.isPartitioned()) {
+            List<String> partitionNames = new ArrayList<>();
+
+            for (Partition partition : hiveClient.getPartitions(hiveTable)) {
+                String partitionName = String.join(",", partition.getValues());
+                partitionNames.add(partitionName);
+            }
+
+            List<AtlasEntity> partitions = toPartitions(partitionNames, tableEntity, database.getAttribute("name").toString());
+
+            if (partitions != null) {
+                List<AtlasObjectId> partitionGuids = partitions.stream().map(p -> new AtlasObjectId(p.getGuid())).collect(Collectors.toList());
+
+                for (AtlasEntity partition: partitions) {
+                    ret.addEntity(partition);
+                }
+
+                tableEntity.setRelationshipAttribute(ATTRIBUTE_HIVE_TABLE_PARTITIONS, partitionGuids);
             }
         }
 
         table.setEntity(tableEntity);
 
-        return table;
+        ret.addEntity(table.getEntity());
+
+        return ret;
     }
 
     private AtlasEntity toStorageDescEntity(StorageDescriptor storageDesc, String tableQualifiedName, String sdQualifiedName, AtlasObjectId tableId ) throws AtlasHookException {
@@ -741,6 +799,37 @@ public class HiveMetaStoreBridge {
 
             ret.add(column);
         }
+        return ret;
+    }
+
+    private List<AtlasEntity> toPartitions(List<String> partitionNames, AtlasEntity table, String dbName) throws AtlasHookException, AtlasException {
+        List<AtlasEntity> ret = new ArrayList<>();
+
+        String tableGuid = table.getGuid();
+
+        String tableName = table.getAttribute("name").toString();
+        String tableQualifiedName = table.getAttribute("qualifiedName").toString();
+
+        LOG.info("Processing {} partitions for table: {} (guid: {})", partitionNames.size(), tableQualifiedName, tableGuid);
+
+        for (String partitionName : partitionNames) {
+            LOG.debug("Processing partition {}", partitionName);
+
+            AtlasEntity partition = new AtlasEntity(ATTRIBUTE_HIVE_TABLE_PARTITION);
+
+            partition.setRelationshipAttribute(ATTRIBUTE_TABLE.toLowerCase(), new AtlasObjectId(tableGuid));
+            partition.setAttribute(ATTRIBUTE_NAME, partitionName);
+            partition.setAttribute(ATTRIBUTE_QUALIFIED_NAME, getPartitionQualifiedName(dbName, tableName, partitionName));
+
+            ret.add(partition);
+        }
+
+        return ret;
+    }
+
+    private String getPartitionQualifiedName(String dbName, String tableName, String partitionName) throws AtlasException {
+        String ret = String.format("%s.%s.%s@%s", dbName, tableName, partitionName, getClusterName(ApplicationProperties.get()));
+
         return ret;
     }
 
