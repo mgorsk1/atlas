@@ -104,6 +104,8 @@ public abstract class BaseHiveEvent {
     public static final String ATTRIBUTE_NUM_BUCKETS               = "numBuckets";
     public static final String ATTRIBUTE_STORED_AS_SUB_DIRECTORIES = "storedAsSubDirectories";
     public static final String ATTRIBUTE_TABLE                     = "table";
+    public static final String ATTRIBUTE_HIVE_TABLE_PARTITION      = "hive_table_partition";
+    public static final String ATTRIBUTE_HIVE_TABLE_PARTITIONS     = "partitions";
     public static final String ATTRIBUTE_SERDE_INFO                = "serdeInfo";
     public static final String ATTRIBUTE_SERIALIZATION_LIB         = "serializationLib";
     public static final String ATTRIBUTE_SORT_COLS                 = "sortCols";

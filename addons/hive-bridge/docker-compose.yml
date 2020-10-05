@@ -1,0 +1,49 @@
+version: '3'
+
+services:
+  atlas:
+    # the image comes from https://github.com/ing-bank/rokku-dev-apache-atlas
+    # it might take some time for Atlas to start
+    image: wbaa/rokku-dev-apache-atlas:0.1.5
+    container_name: atlas
+    ports:
+      - 21000:21000
+    environment:
+      - ATLAS_KICKSTART_AMUNDSEN=true
+    volumes:
+      - ./addons/hive-bridge/target/hive-bridge-3.0.0-SNAPSHOT.jar:/opt/atlas/hook/hive/atlas-hive-hook-impl/hive-bridge-3.0.0-SNAPSHOT.jar
+  hive-metastore:
+    image: artifactory.wbaa.pl.ing.net:443/registry/data-assets/hive-metastore:feature-3-1-0-45d6c032609a04f8ea45fa1e0d4a7ba8b96c1c55
+    container_name: hive-metastore
+    environment:
+      NAMESPACE: dap-dev
+      AWS_ACCESS_KEY_ID: accesskey
+      AWS_SECRET_ACCESS_KEY: secretkey
+      DB_URL: "jdbc:postgresql://hive-metastore-postgresql/metastore"
+      DB_USER: hive
+      DB_PASSWORD: hive
+    depends_on:
+      - hive-metastore-postgresql
+    ports:
+      - "9083:9083"
+  hive-metastore-postgresql:
+    image: postgres:11.3-alpine
+    container_name: hive-metastore-postgresql
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=hive
+      - POSTGRES_DB=metastore
+      - POSTGRES_PASSWORD=hive
+  jupyter:
+    image: jupyter/pyspark-notebook
+    container_name: jupyter
+    ports:
+      - 8888:8888
+    volumes:
+      - /tmp:/tmp
+      - ./tmp/o_udemy.csv:/data/o_udemy.csv
+      - ./tmp/load_dummy_data.ipynb:/home/jovyan/load_dummy_data.ipynb
+
+
+
